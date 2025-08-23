@@ -6,6 +6,21 @@
 # 4) Passivo (whois, whatweb, DNS, WAF/CDN/IP)
 # q) Sair
 
+# TODO (Performance & Robustez):
+# - Paralelizar passos independentes com xargs -P / & e aguardar com wait (ex.: subfinder + assetfinder; gau + wayback; testadores por tipo).
+# - Adotar timeouts consistentes (curl --max-time, tplmap --timeout, sqlmap --time-sec) e retries mínimos.
+# - Cachear artefatos temporários por domínio (ex.: se subs_all.txt existir e --no-refresh, reusar).
+# - Normalizar saída sem cores e sem stderr ruidoso; redirecionar 2>/dev/null onde apropriado.
+# - Validar existência de arquivos antes de grep/sort para evitar "No such file".
+# - Usar set -euo pipefail (já habilitado) e traps para limpar TMP em exit.
+# - Sanitizar domínios/URLs rigorosamente; evitar chamar katana -list quando arquivo vazio.
+# - Tornar PROGRESS_MAX_SECS ajustável por env; fallback para spinner sem % se não quiser tempo estimado.
+# - Consolidar funções repetidas (ex.: blocos de coleta) e usar helpers run_with_progress/print_top.
+
+# UI cores extra (já declaradas), alinhar bullets e usar emojis sutis
+# Sugerido: manter seções separadas por hr(), banners com título da fase,
+# e amostras com print_top(...) para dar credibilidade sem poluir o console.
+
 set -euo pipefail
 
 # ===== UI =====
@@ -15,12 +30,16 @@ ok(){   echo -e "${CG}✔${C0}  $*"; }
 warn(){ echo -e "${CY}⚠${C0}  $*"; }
 err(){  echo -e "${CR}✖${C0}  $*" >&2; }
 need(){ command -v "$1" >/dev/null 2>&1 || { err "ferramenta ausente: $1"; return 1; }; }
+ # ===== Helpers genéricos =====
 countf(){ [[ -f "$1" ]] && wc -l < "$1" || echo 0; }
 sanitize_domain(){ local d="$1"; d="${d#http://}"; d="${d#https://}"; d="${d%%/*}"; echo "$d"; }
+prep_dirs(){ DOMAIN="$1"; BASE="$HOME/recon/$DOMAIN"; TMP="/tmp/recon-$DOMAIN"; mkdir -p "$BASE"/{intel,subs,urls,vectors,findings} "$TMP" "$TMP/urls"; }
+
 banner(){ local t="$1"; local l=$(printf "%*s" $(( ${#t} + 6 )) | tr " " "═"); echo -e "${CW}${B}╔${l}╗${C0}"; printf "${CW}${B}║   ${C0}${B}%s${CW}${B}   ║${C0}\n" "$t"; echo -e "${CW}${B}╚${l}╝${C0}"; }
 hr(){ echo -e "${DIM}────────────────────────────────────────────────────────${C0}"; }
-print_top(){ # print up to N lines of file with prefix
-  local file="$1" n="${2:-5}" prefix="${3:-"  • "}"
+
+print_top(){ # print up to N lines of a file with a prefix
+  local file="$1" n="${2:-5}" prefix=${3:-"  • "}
   [[ -s "$file" ]] || return 0
   local i=0
   while IFS= read -r l; do
@@ -30,7 +49,33 @@ print_top(){ # print up to N lines of file with prefix
   [[ $(countf "$file") -gt $n ]] && echo "${DIM}  … ($(countf "$file") total)${C0}"
 }
 
-prep_dirs(){ DOMAIN="$1"; BASE="$HOME/recon/$DOMAIN"; TMP="/tmp/recon-$DOMAIN"; mkdir -p "$BASE"/{intel,subs,urls,vectors,findings} "$TMP" "$TMP/urls"; }
+# Executa comando com progresso (% baseado em tempo máximo estimado)
+# Uso: run_with_progress "Descrição amigável" bash -lc "comando…"
+run_with_progress(){
+  local title="$1"; shift
+  local max=${PROGRESS_MAX_SECS:-240}           # ajuste global se quiser
+  local cmd=("$@")
+
+  echo -e "${CY}⟲${C0} $title"
+  echo -e "${DIM}↪ ${C0}${B}${cmd[*]}${C0}"
+
+  ("${cmd[@]}") &
+  local pid=$!
+  local start=$(date +%s)
+  tput civis 2>/dev/null || true
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 0.2
+    local el=$(( $(date +%s) - start ))
+    local pct=$(( el*100 / max ))
+    (( pct > 99 )) && pct=99
+    printf "\r${CB}[..]${C0} %3d%%  elapsed %02d:%02d" "$pct" $((el/60)) $((el%60))
+  done
+  wait "$pid"; local rc=$?
+  local el=$(( $(date +%s) - start ))
+  printf "\r${CG}[OK]${C0}  100%% in %02d:%02d\n" $((el/60)) $((el%60))
+  tput cnorm 2>/dev/null || true
+  return $rc
+}
 
 # ===== Python helpers para URLs =====
 make_url_variants() { # um param por vez -> NEWVAL
@@ -195,27 +240,22 @@ run_bug_bounty(){
   banner "Bug Bounty — $DOMAIN"
 
   # Subdomínios
-  log "Subdomínios (subfinder + assetfinder)…"
-  subfinder -d "$DOMAIN" -all -silent > "$TMP/subs1.txt" || true
-  assetfinder --subs-only "$DOMAIN"   | sort -u > "$TMP/subs2.txt" || true
+  run_with_progress "Subfinder"  bash -lc "subfinder -d '$DOMAIN' -all -silent > '$TMP/subs1.txt' || true"
+  run_with_progress "Assetfinder" bash -lc "assetfinder --subs-only '$DOMAIN' | sort -u > '$TMP/subs2.txt' || true"
   cat "$TMP"/subs*.txt 2>/dev/null | sort -u > "$BASE/subs/subdomains_all.txt" || true
   local SUBS_TOTAL=$(countf "$BASE/subs/subdomains_all.txt")
   ok "subdomínios encontrados: ${B}${SUBS_TOTAL}${C0}"
   print_top "$BASE/subs/subdomains_all.txt" 5 "    ↳ "
 
   # Takeover
-  log "Takeover (subzy)…"
   : > "$BASE/subs/takeover.txt"
-  subzy run --targets "$BASE/subs/subdomains_all.txt" --hide_fails --verify_ssl --concurrency 50 \
-       -o "$BASE/subs/takeover.txt" >/dev/null 2>&1 || true
+  run_with_progress "Subzy (takeover)" bash -lc "subzy run --targets '$BASE/subs/subdomains_all.txt' --hide_fails --verify_ssl --concurrency 50 -o '$BASE/subs/takeover.txt' >/dev/null 2>&1 || true"
   local TAKE_POS=$(grep -i "vulnerable" "$BASE/subs/takeover.txt" 2>/dev/null | wc -l | tr -d ' ')
-  ok "takeover verificados: ${SUBS_TOTAL} | positivos: ${B}${TAKE_POS}${C0} | $BASE/subs/takeover.txt"
+  ok "takeover verificados: ${SUBS_TOTAL} | positivos: ${B}${TAKE_POS}${C0}"
   [[ $TAKE_POS -gt 0 ]] && print_top "$BASE/subs/takeover.txt" 5 "    ↳ "
 
   # HTTPX (tmp)
-  log "HTTPX (filtrando vivos)…"
-  httpx -l "$BASE/subs/subdomains_all.txt" -silent -status-code -title -tech-detect -server -ip -tls -cdn -location \
-       -o "$TMP/httpx_live.txt" >/dev/null 2>&1 || true
+  run_with_progress "HTTPX (vivos)" bash -lc "httpx -l '$BASE/subs/subdomains_all.txt' -silent -status-code -title -tech-detect -server -ip -tls -cdn -location -o '$TMP/httpx_live.txt' >/dev/null 2>&1 || true"
   cut -d' ' -f1 "$TMP/httpx_live.txt" > "$TMP/subdomains_live.txt" || true
   local LIVE=$(countf "$TMP/subdomains_live.txt"); local LIVE_PCT=0
   [[ $SUBS_TOTAL -gt 0 ]] && LIVE_PCT=$((100*LIVE/SUBS_TOTAL))
@@ -223,19 +263,16 @@ run_bug_bounty(){
   [[ $LIVE -gt 0 ]] && print_top "$TMP/subdomains_live.txt" 5 "    ↳ "
 
   # URLs
-  log "Coleta de URLs…"
   : > "$BASE/urls/urls_all.txt"; mkdir -p "$TMP/urls"
-  echo "$DOMAIN" | gau --subs --providers wayback,commoncrawl,otx > "$TMP/urls/gau.txt" 2>/dev/null || true
-  echo "$DOMAIN" | waybackurls                                  > "$TMP/urls/wayback.txt" 2>/dev/null || true
+  run_with_progress "GAU (historico)"       bash -lc "echo '$DOMAIN' | gau --subs --providers wayback,commoncrawl,otx > '$TMP/urls/gau.txt' 2>/dev/null || true"
+  run_with_progress "waybackurls (archive)" bash -lc "echo '$DOMAIN' | waybackurls > '$TMP/urls/wayback.txt' 2>/dev/null || true"
   if [[ $LIVE -gt 0 ]]; then
-    katana -list "$TMP/subdomains_live.txt" -depth 3 -silent > "$TMP/urls/katana.txt" 2>/dev/null || true
+    run_with_progress "Katana (crawl vivos)" bash -lc "katana -list '$TMP/subdomains_live.txt' -depth 3 -silent > '$TMP/urls/katana.txt' 2>/dev/null || true"
   else
-    katana -u "https://$DOMAIN" -depth 2 -silent > "$TMP/urls/katana.txt" 2>/dev/null || true
+    run_with_progress "Katana (root)"        bash -lc "katana -u 'https://$DOMAIN' -depth 2 -silent > '$TMP/urls/katana.txt' 2>/dev/null || true"
   fi
   cat "$TMP/urls"/*.txt 2>/dev/null | sed 's/\s\+$//' | sort -u > "$BASE/urls/urls_all.txt" || true
-  local GAU=$(countf "$TMP/urls/gau.txt"); local WB=$(countf "$TMP/urls/wayback.txt"); local KAT=$(countf "$TMP/urls/katana.txt")
-  local URLS=$(countf "$BASE/urls/urls_all.txt")
-  ok "URLs: gau=${B}$GAU${C0} | wayback=${B}$WB${C0} | katana=${B}$KAT${C0} | total=${B}$URLS${C0} → $BASE/urls/urls_all.txt"
+  ok "URLs: gau=${B}$(countf "$TMP/urls/gau.txt")${C0} | wayback=${B}$(countf "$TMP/urls/wayback.txt")${C0} | katana=${B}$(countf "$TMP/urls/katana.txt")${C0} | total=${B}$(countf "$BASE/urls/urls_all.txt")${C0} → $BASE/urls/urls_all.txt"
   print_top "$BASE/urls/urls_all.txt" 5 "    ↳ "
   hr
 
@@ -340,30 +377,84 @@ run_bug_bounty(){
 run_wpscan(){
   local DOMAIN="$1"; prep_dirs "$DOMAIN"; need wpscan || return 1
   banner "WPScan — $DOMAIN"
-  local TOKEN="GRa5RV3wTapgEXZKKMcdQwZD3F9jwTYHaBMb4swZ05Q"
-  log "executando WPScan completo…"
-  wpscan --url "https://$DOMAIN" --enumerate u,ap,at,cb,dbe \
-         --random-user-agent --disable-tls-checks \
-         --api-token "$TOKEN" \
-         -o "$BASE/intel/wpscan.txt" >/dev/null 2>&1 || true
+  local TOKEN="${WPVULNDB_API_TOKEN:-GRa5RV3wTapgEXZKKMcdQwZD3F9jwTYHaBMb4swZ05Q}"
+  run_with_progress "WPScan completo" bash -lc "wpscan --url 'https://$DOMAIN' --enumerate u,ap,at,cb,dbe --random-user-agent --disable-tls-checks --api-token '$TOKEN' -o '$BASE/intel/wpscan.txt' >/dev/null 2>&1 || true"
   local WP_VULN=$(grep -i "vulnerab" "$BASE/intel/wpscan.txt" 2>/dev/null | wc -l | tr -d ' ')
   ok "salvo → $BASE/intel/wpscan.txt (possíveis ocorrências: ${B}${WP_VULN}${C0})"
-  hr
 }
-
-# ===== Opção 4: Passivo =====
 run_passive(){
   local DOMAIN="$1"; prep_dirs "$DOMAIN"
   banner "Passivo — $DOMAIN"
   mkdir -p "$BASE/intel/passive"
-  command -v whois   >/dev/null 2>&1 && { log "WHOIS"; whois "$DOMAIN" > "$BASE/intel/passive/whois.txt" 2>/dev/null || true; }
-  command -v whatweb >/dev/null 2>&1 && { log "WhatWeb"; whatweb --color=never --no-errors -a 3 "http://$DOMAIN" "https://$DOMAIN" > "$BASE/intel/passive/whatweb_root.txt" 2>/dev/null || true; }
-  command -v dnsx    >/dev/null 2>&1 && { log "DNS"; echo "$DOMAIN" > "$TMP/domain.txt"; dnsx -l "$TMP/domain.txt" -a -aaaa -cname -mx -ns -txt -silent > "$BASE/intel/passive/dns_records.txt" || true; }
-  command -v wafw00f >/dev/null 2>&1 && { log "WAF"; wafw00f "https://$DOMAIN" > "$BASE/intel/passive/wafw00f.txt" 2>/dev/null || true; }
-  command -v httpx   >/dev/null 2>&1 && { log "HTTPX"; httpx -u "https://$DOMAIN" -silent -status-code -title -tech-detect -server -ip -tls -cdn -location > "$BASE/intel/passive/httpx_root.txt" || true; }
+
+  # WHOIS
+  if command -v whois >/dev/null 2>&1; then
+    run_with_progress "WHOIS" bash -lc "whois '$DOMAIN' > '$BASE/intel/passive/whois.txt' 2>/dev/null || true"
+    # resumo visível
+    local reg cr exp ns
+    reg=$(grep -iE 'Registrar:|Registrar Name' "$BASE/intel/passive/whois.txt" | head -1 | sed 's/^[[:space:]]*//')
+    cr=$(grep -iE 'Creation Date:|Created On' "$BASE/intel/passive/whois.txt" | head -1 | sed 's/^[[:space:]]*//')
+    exp=$(grep -iE 'Expiry Date:|Registrar Registration Expiration Date' "$BASE/intel/passive/whois.txt" | head -1 | sed 's/^[[:space:]]*//')
+    ns=$(grep -iE '^Name Server' "$BASE/intel/passive/whois.txt" | wc -l | tr -d ' ')
+    [[ -n "$reg" ]] && echo "  • $reg"
+    [[ -n "$cr"  ]] && echo "  • $cr"
+    [[ -n "$exp" ]] && echo "  • $exp"
+    echo "  • Name Servers: $ns"
+    hr
+  else
+    warn "whois não encontrado"
+  fi
+
+  # WhatWeb raiz
+  if command -v whatweb >/dev/null 2>&1; then
+    run_with_progress "WhatWeb (raiz)" bash -lc "whatweb --color=never --no-errors -a 3 'http://$DOMAIN' 'https://$DOMAIN' > '$BASE/intel/passive/whatweb_root.txt' 2>/dev/null || true"
+    local title srv techs
+    title=$(grep -Eo 'Title\[[^]]+\]' "$BASE/intel/passive/whatweb_root.txt" | head -1 | sed 's/Title\[//;s/]//')
+    srv=$(grep -Eo 'HTTPServer\[[^]]+\]' "$BASE/intel/passive/whatweb_root.txt" | head -1 | sed 's/HTTPServer\[//;s/]//')
+    techs=$(grep -Eo '(WordPress|jQuery|PHP|ASP\.NET|Drupal|Laravel|React|Vue|Angular)' "$BASE/intel/passive/whatweb_root.txt" | sort -u | tr '\n' ',' | sed 's/,$//')
+    [[ -n "$title" ]] && echo "  • Title: $title"
+    [[ -n "$srv"   ]] && echo "  • Server: $srv"
+    [[ -n "$techs" ]] && echo "  • Techs: $techs"
+    hr
+  else
+    warn "whatweb não encontrado"
+  fi
+
+  # DNS (A/AAAA/CNAME/MX/NS/TXT)
+  if command -v dnsx >/dev/null 2>&1; then
+    echo "$DOMAIN" > "$TMP/domain.txt"
+    run_with_progress "DNS (dnsx)" bash -lc "dnsx -l '$TMP/domain.txt' -a -aaaa -cname -mx -ns -txt -silent > '$BASE/intel/passive/dns_records.txt' || true"
+    echo "  • Registros (linhas): $(countf "$BASE/intel/passive/dns_records.txt")"
+    print_top "$BASE/intel/passive/dns_records.txt" 5 "    ↳ "
+    hr
+  else
+    warn "dnsx não encontrado"
+  fi
+
+  # WAF
+  if command -v wafw00f >/dev/null 2>&1; then
+    run_with_progress "WAF (wafw00f)" bash -lc "wafw00f 'https://$DOMAIN' > '$BASE/intel/passive/wafw00f.txt' 2>/dev/null || true"
+    local waf
+    waf=$(grep -iE 'is behind|detected' "$BASE/intel/passive/wafw00f.txt" | head -1)
+    [[ -n "$waf" ]] && echo "  • $waf" || echo "  • Nenhum WAF detectado"
+    hr
+  else
+    warn "wafw00f não encontrado"
+  fi
+
+  # HTTPX root
+  if command -v httpx >/dev/null 2>&1; then
+    run_with_progress "HTTPX (root)" bash -lc "httpx -u 'https://$DOMAIN' -silent -status-code -title -tech-detect -server -ip -tls -cdn -location > '$BASE/intel/passive/httpx_root.txt' || true"
+    echo "  • Fingerprint:"
+    print_top "$BASE/intel/passive/httpx_root.txt" 3 "    ↳ "
+    hr
+  else
+    warn "httpx não encontrado"
+  fi
+
   ok "passivo salvo em $BASE/intel/passive/"
-  hr
 }
+
 
 # ===== Menu =====
 clear
