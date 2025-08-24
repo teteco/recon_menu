@@ -134,20 +134,23 @@ alias curl='curl -A "$STEALTH_UA" -H "Accept: text/html,application/xhtml+xml,ap
 # ===== Python helpers para URLs =====
 make_url_variants() { # um param por vez -> NEWVAL
   local NEWVAL="$1"
-  python3 - "$NEWVAL" <<'PY'
+  python3 <<'PY' "$NEWVAL"
 import sys, urllib.parse
 newval = sys.argv[1]
 for raw in sys.stdin:
     raw = raw.strip()
-    if not raw or '?' not in raw: continue
+    if not raw or '?' not in raw:
+        continue
     try:
         u = urllib.parse.urlsplit(raw)
         qs = urllib.parse.parse_qsl(u.query, keep_blank_values=True)
-        if not qs: continue
-        for i,(k,v) in enumerate(qs):
-            qs2 = list(qs); qs2[i] = (k, newval)
+        if not qs:
+            continue
+        for i, (k, v) in enumerate(qs):
+            qs2 = list(qs)
+            qs2[i] = (k, newval)
             new_query = urllib.parse.urlencode(qs2, doseq=True)
-            print(urllib.parse.urlunsplit((u.scheme,u.netloc,u.path,new_query,u.fragment)))
+            print(urllib.parse.urlunsplit((u.scheme, u.netloc, u.path, new_query, u.fragment)))
     except Exception:
         pass
 PY
@@ -155,24 +158,29 @@ PY
 
 replace_param_value_all() { # todos os params -> NEWVAL
   local URL="$1" NEWVAL="$2"
-@@ -62,326 +161,442 @@ url = sys.argv[1]; newval = sys.argv[2]
+  python3 <<'PY' "$URL" "$NEWVAL"
+import sys, urllib.parse
+url = sys.argv[1]
+newval = sys.argv[2]
 u = urllib.parse.urlsplit(url)
 qs = urllib.parse.parse_qsl(u.query, keep_blank_values=True)
 if not qs:
-    print(url); sys.exit(0)
-qs2 = [(k,newval) for k,_ in qs]
+    print(url)
+    sys.exit(0)
+qs2 = [(k, newval) for k, _ in qs]
 new_query = urllib.parse.urlencode(qs2, doseq=True)
-print(urllib.parse.urlunsplit((u.scheme,u.netloc,u.path,new_query,u.fragment)))
+print(urllib.parse.urlunsplit((u.scheme, u.netloc, u.path, new_query, u.fragment)))
 PY
 }
 
 host_from_url(){
-  python3 - "$1" <<'PY'
+  python3 <<'PY' "$1"
 import sys, urllib.parse
-u=sys.argv[1].strip()
+u = sys.argv[1].strip()
 try:
-  print(urllib.parse.urlsplit(u).netloc.split(":")[0])
-except: print("")
+    print(urllib.parse.urlsplit(u).netloc.split(":")[0])
+except Exception:
+    print("")
 PY
 }
 
